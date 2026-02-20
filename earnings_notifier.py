@@ -82,12 +82,18 @@ def fetch_tdnet() -> list[dict]:
                 d = item.get("Tdnet") or item
                 doc_id  = str(d.get("id") or "")
                 company = d.get("company_name") or ""
-                ticker  = str(d.get("company_code") or "").replace("0", "", 1)[:4]
+                code    = str(d.get("company_code") or "")
+                ticker  = code.replace("0", "", 1)[:4]
                 title   = d.get("title") or ""
                 pub_at  = d.get("pubdate") or ""
                 url_pdf = d.get("document_url") or ""
 
                 if not doc_id or not title:
+                    continue
+
+                # 個別株のみ（4桁数字）、REIT・投資信託・ETF等を除外
+                # 例: 個別株=72030, REIT=8960A, ETF=1234A など末尾アルファベットを除外
+                if not code.isdigit():
                     continue
 
                 results.append({
@@ -181,10 +187,14 @@ def get_financials(ticker_jp: str) -> dict:
 # ──────────────────────────────────────────────
 def fmt_yen(value) -> str:
     if value is None: return "N/A"
-    v = float(value)
-    if abs(v) >= 1e12: return f"{v/1e12:.2f}兆円"
-    if abs(v) >= 1e8:  return f"{v/1e8:.1f}億円"
-    return f"{v/1e4:.0f}万円"
+    try:
+        v = float(value)
+        if v != v: return "N/A"  # NaNチェック
+        if abs(v) >= 1e12: return f"{v/1e12:.2f}兆円"
+        if abs(v) >= 1e8:  return f"{v/1e8:.1f}億円"
+        return f"{v/1e4:.0f}万円"
+    except:
+        return "N/A"
 
 def fmt_yoy(cur, prev) -> str:
     """前期比を計算して矢印付きで返す"""
