@@ -63,14 +63,30 @@ def edinet_headers() -> dict:
 def fetch_edinet_documents(target_date: str) -> list[dict]:
     """指定日の書類一覧を取得"""
     url = f"{EDINET_BASE}/documents.json"
-    params = {"date": target_date, "type": 2}  # type=2: 有価証券関連のみ
+    # type=1: メタデータのみ（APIキー不要）
+    # type=2: 書類情報あり（APIキー必須） → キーがあれば使う
+    doc_type = 2 if EDINET_API_KEY else 1
+    params = {"date": target_date, "type": doc_type}
     try:
         r = requests.get(url, params=params, headers=edinet_headers(), timeout=30)
         r.raise_for_status()
         data = r.json()
-        return data.get("results", [])
+        results = data.get("results", [])
+        print(f"[EDINET] {target_date} → {len(results)}件 (type={doc_type})")
+
+        # type=1の場合はメタのみなので docDescription などが空になる可能性がある
+        # → 件数確認用にログ出力して返す
+        if results:
+            sample = results[0]
+            print(f"[EDINET] サンプル: {sample.get('filerName','')} / formCode={sample.get('formCode','')} / docTypeCode={sample.get('docTypeCode','')}")
+        return results
     except Exception as e:
         print(f"[EDINET] 書類一覧取得エラー: {e}")
+        # レスポンス内容も出力して原因特定しやすくする
+        try:
+            print(f"[EDINET] レスポンス: {r.text[:300]}")
+        except:
+            pass
         return []
 
 def classify_doc(doc: dict) -> str | None:
@@ -219,15 +235,24 @@ def post_discord(webhook_url: str, payload: dict):
 # ──────────────────────────────────────────────
 def main():
     sent = load_sent()
-    today = date.today().strftime("%Y-%m-%d")
-    # 土日は前営業日に遡る
-    docs = fetch_edinet_documents(today)
-    if not docs:
-        # 前日も試す（土日・祝日対策）
-        prev = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
-        docs = fetch_edinet_documents(prev)
 
-    print(f"[EDINET] {len(docs)}件取得")
+    # 直近5日分を順番に試す（土日・祝日・データ遅延対策）
+    docs = []
+    for days_ago in range(0, 5):
+        target = (date.today() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        docs = fetch_edinet_documents(target)
+        if docs:
+            print(f"[EDINET] {target} のデータを使用 ({len(docs)}件)")
+            break
+
+    if not docs:
+        print("[EDINET] 直近5日分すべて0件。終了。")
+        return
+
+    # 分類ごとの件数を表示
+    classified = [classify_doc(d) for d in docs]
+    from collections import Counter
+    print(f"[分類] {Counter(c for c in classified if c)}")
 
     for doc in docs:
         doc_id = doc.get("docID", "")
