@@ -1,6 +1,6 @@
 """
 決算・ニュース Discord通知Bot
-- TDnet RSSフィードで決算短信をリアルタイム取得
+- yanoshin TDnet API（非公式・無料）で決算短信をリアルタイム取得
 - EDINET APIで業績修正・薬事承認を補完
 - yfinanceで財務データを取得
 """
@@ -10,8 +10,6 @@ import json
 import time
 import requests
 import yfinance as yf
-import xml.etree.ElementTree as ET
-from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -22,11 +20,9 @@ EDINET_API_KEY           = os.environ.get("EDINET_API_KEY", "")
 SENT_FILE   = Path("sent_ids.json")
 EDINET_BASE = "https://api.edinet-fsa.go.jp/api/v2"
 
-# TDnet RSSフィード（東証適時開示 全件）
-TDNET_RSS_URLS = [
-    "https://www.release.tdnet.info/inbs/RSS_I_main_00.xml",   # 当日全件
-    "https://www.release.tdnet.info/inbs/RSS_I_main_01.xml",   # 前日
-]
+# yanoshin TDnet API（無料・非公式）
+# today = 当日のみ、recent = 直近
+TDNET_API_URL = "https://webapi.yanoshin.jp/webapi/tdnet/list/today.json"
 
 EDINET_SKIP = [
     "有価証券報告書", "四半期報告書", "半期報告書",
@@ -48,67 +44,60 @@ def save_sent(sent: set):
     SENT_FILE.write_text(json.dumps({"ids": ids}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ──────────────────────────────────────────────
-# TDnet RSS取得
+# yanoshin TDnet API
 # ──────────────────────────────────────────────
-def fetch_tdnet_rss() -> list[dict]:
+def fetch_tdnet() -> list[dict]:
     results = []
     headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
 
-    for rss_url in TDNET_RSS_URLS:
-        try:
-            r = requests.get(rss_url, headers=headers, timeout=30)
-            print(f"[TDnet RSS] {rss_url} → {r.status_code}")
+    # 当日と前日の2日分取得
+    urls = [
+        "https://webapi.yanoshin.jp/webapi/tdnet/list/today.json",
+        "https://webapi.yanoshin.jp/webapi/tdnet/list/yesterday.json",
+    ]
 
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            print(f"[TDnet] {url} → {r.status_code}")
             if r.status_code != 200:
                 continue
 
-            # デバッグ：先頭200文字表示
-            print(f"[TDnet RSS] 先頭: {r.text[:300]!r}")
+            data = r.json()
+            print(f"[TDnet] レスポンスキー: {list(data.keys()) if isinstance(data, dict) else type(data)}")
 
-            root = ET.fromstring(r.content)
-            ns   = {"": root.tag.split("}")[0].strip("{")} if "}" in root.tag else {}
+            # items or results or list
+            items = []
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("items") or data.get("results") or data.get("list") or []
 
-            # RSS 2.0 形式
-            items = root.findall(".//item")
-            print(f"[TDnet RSS] item数: {len(items)}")
+            print(f"[TDnet] {len(items)}件")
+            if items:
+                print(f"[TDnet] サンプル: {items[0]}")
 
             for item in items:
-                def txt(tag):
-                    el = item.find(tag)
-                    return el.text.strip() if el is not None and el.text else ""
+                # フィールド名を柔軟に取得
+                doc_id  = str(item.get("id") or item.get("seqno") or item.get("document_id") or "")
+                company = item.get("company_name") or item.get("name") or item.get("company") or ""
+                ticker  = str(item.get("stockcode") or item.get("code") or item.get("ticker") or "").zfill(4)
+                title   = item.get("title") or item.get("document_name") or ""
+                pub_at  = item.get("pubdate") or item.get("published_at") or item.get("time") or ""
+                url_pdf = item.get("url") or item.get("document_url") or ""
 
-                title   = txt("title")
-                link    = txt("link")
-                pubdate = txt("pubDate")
-                desc    = txt("description")
-
-                # descriptionからticker・会社名を抽出
-                # 形式例: "7203 トヨタ自動車"
-                company = desc
-                ticker  = ""
-                parts   = desc.strip().split(" ", 1)
-                if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
-                    ticker  = parts[0]
-                    company = parts[1]
-
-                doc_id = link.split("=")[-1] if "=" in link else f"rss_{title[:30]}"
+                if not doc_id or not title:
+                    continue
 
                 results.append({
-                    "id":      doc_id,
-                    "company": company,
-                    "ticker":  ticker,
-                    "title":   title,
-                    "time":    pubdate,
-                    "url":     link,
-                    "source":  "tdnet",
+                    "id": doc_id, "company": company, "ticker": ticker,
+                    "title": title, "time": pub_at, "url": url_pdf,
                 })
 
         except Exception as e:
-            print(f"[TDnet RSS] エラー ({rss_url}): {e}")
+            print(f"[TDnet] エラー ({url}): {e}")
 
-    print(f"[TDnet RSS] 合計: {len(results)}件")
-    if results:
-        print(f"[TDnet RSS] サンプル: {results[0]}")
+    print(f"[TDnet] 合計: {len(results)}件")
     return results
 
 def classify_tdnet(item: dict) -> str | None:
@@ -197,7 +186,7 @@ def build_earnings_embed(item: dict, fin: dict) -> dict:
         "embeds": [{
             "title": heading,
             "description": item.get("title", ""),
-            "url": item.get("url", "https://www.release.tdnet.info"),
+            "url": item.get("url") or "https://www.release.tdnet.info",
             "color": 0x00b4d8,
             "fields": [
                 {"name": "💹 売上高",     "value": fmt_yen(fin.get("revenue")),    "inline": True},
@@ -244,8 +233,8 @@ def main():
     new_sent = 0
     print(f"[送信済みID] {len(sent)}件をロード")
 
-    # TDnet RSS
-    for item in fetch_tdnet_rss():
+    # TDnet（yanoshin API）
+    for item in fetch_tdnet():
         itype = classify_tdnet(item)
         if not itype: continue
         doc_id = f"tdnet_{item['id']}"
@@ -257,7 +246,7 @@ def main():
             print(f"[決算送信] {item['company']}（{ticker}）")
         else:
             post_discord(DISCORD_NEWS_WEBHOOK, build_news_embed(
-                item["company"], ticker, item["title"], item["url"], itype))
+                item["company"], ticker, item["title"], item.get("url",""), itype))
             print(f"[ニュース送信] {itype} / {item['company']}")
         sent.add(doc_id)
         new_sent += 1
