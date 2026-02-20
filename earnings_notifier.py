@@ -92,25 +92,40 @@ def fetch_edinet_documents(target_date: str) -> list[dict]:
 def classify_doc(doc: dict) -> str | None:
     """書類種別を分類して返す"""
     form = doc.get("formCode", "")
-    doc_type = doc.get("docTypeCode", "")
-    ordinance = doc.get("ordinanceCode", "")
-
-    # 決算短信
-    if form in ("030000", "043000", "044000"):
-        return "earnings"
-    # 有価証券報告書
-    if form == "030001":
-        return "annual_report"
-    # 適時開示 (臨時報告書)
-    if form == "020000":
-        return "timely"
-    # 上方・下方修正
-    if "修正" in doc.get("docDescription", ""):
-        return "revision"
-    # 新薬承認等
     desc = doc.get("docDescription", "")
-    if any(kw in desc for kw in ["承認", "薬事", "FDA", "医薬品"]):
+
+    # ── 決算短信（東証規則・内閣府令どちらも） ──
+    # docDescription に「決算短信」を含むものすべてを対象にする
+    if any(kw in desc for kw in ["決算短信", "四半期決算短信", "中間決算短信"]):
+        return "earnings"
+    # formCodeベースでも拾う（念のため）
+    if form in (
+        "030000", "030001",  # 有価証券報告書・半期
+        "043000", "043001",  # 四半期報告書
+        "044000", "044001",  # 半期報告書
+        "020000",            # 臨時報告書（決算含む場合あり）
+    ):
+        # 有価証券報告書は別扱い
+        if form in ("030000", "030001"):
+            return "annual_report"
+        return "earnings"
+
+    # ── 上方・下方修正 ──
+    if any(kw in desc for kw in ["上方修正", "下方修正", "業績修正", "業績予想の修正"]):
+        return "revision"
+
+    # ── 適時開示・臨時報告書 ──
+    if any(kw in desc for kw in ["適時開示", "臨時報告", "重要事実"]):
+        return "timely"
+
+    # ── 新薬・医薬品承認 ──
+    if any(kw in desc for kw in ["承認", "薬事", "FDA", "医薬品", "治験"]):
         return "pharma"
+
+    # ── 有価証券報告書（formCode未一致の場合も） ──
+    if "有価証券報告書" in desc:
+        return "annual_report"
+
     return None
 
 # ──────────────────────────────────────────────
@@ -252,7 +267,13 @@ def main():
     # 分類ごとの件数を表示
     classified = [classify_doc(d) for d in docs]
     from collections import Counter
-    print(f"[分類] {Counter(c for c in classified if c)}")
+    counts = Counter(c for c in classified if c)
+    print(f"[分類] {counts}")
+
+    # 決算として検出した書類をログ出力
+    for d, c in zip(docs, classified):
+        if c == "earnings":
+            print(f"[決算検出] {d.get('filerName','')} | {d.get('docDescription','')} | formCode={d.get('formCode','')} | secCode={d.get('secCode','')}")
 
     for doc in docs:
         doc_id = doc.get("docID", "")
