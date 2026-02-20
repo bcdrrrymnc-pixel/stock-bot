@@ -1,7 +1,8 @@
 """
 決算・ニュース Discord通知Bot
-- EDINET APIで決算短信・業績修正・重要開示を取得
-- yfinanceで財務データを補完
+- TDnet（東証適時開示）で決算短信をリアルタイム取得 ← メイン
+- EDINET APIで業績修正・薬事承認などを補完
+- yfinanceで財務データを取得
 - Discordの決算チャンネル・ニュースチャンネルに通知
 """
 
@@ -10,6 +11,7 @@ import json
 import time
 import requests
 import yfinance as yf
+from bs4 import BeautifulSoup
 from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -21,14 +23,15 @@ DISCORD_EARNINGS_WEBHOOK = os.environ["DISCORD_EARNINGS_WEBHOOK"]
 DISCORD_NEWS_WEBHOOK     = os.environ["DISCORD_NEWS_WEBHOOK"]
 EDINET_API_KEY           = os.environ.get("EDINET_API_KEY", "")
 
-SENT_FILE   = Path("sent_ids.json")
-EDINET_BASE = "https://api.edinet-fsa.go.jp/api/v2"
+SENT_FILE    = Path("sent_ids.json")
+EDINET_BASE  = "https://api.edinet-fsa.go.jp/api/v2"
+TDNET_URL    = "https://www.release.tdnet.info/inbs/I_main_00.html"
 
-# 通知しない書類（大量に来るため除外）
-SKIP_KEYWORDS = [
+# EDINETで除外する書類
+EDINET_SKIP = [
     "有価証券報告書", "四半期報告書", "半期報告書",
     "臨時報告書", "内部統制報告書", "大量保有報告書",
-    "変更報告書", "公開買付", "訂正",
+    "変更報告書", "公開買付", "訂正", "有価証券届出書",
 ]
 
 # ──────────────────────────────────────────────
@@ -41,14 +44,82 @@ def load_sent() -> set:
     return set()
 
 def save_sent(sent: set):
-    ids = list(sent)[-2000:]
+    ids = list(sent)[-3000:]
     SENT_FILE.write_text(
         json.dumps({"ids": ids}, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
 
 # ──────────────────────────────────────────────
-# EDINET API
+# TDnet スクレイピング（東証適時開示）
+# ──────────────────────────────────────────────
+def fetch_tdnet_disclosures() -> list[dict]:
+    """
+    TDnetの当日開示一覧を取得。
+    返り値: [{"id", "company", "ticker", "title", "time", "url"}, ...]
+    """
+    results = []
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
+        r = requests.get(TDNET_URL, headers=headers, timeout=30)
+        r.encoding = "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # TDnetのテーブル行をパース
+        rows = soup.select("table#main-list-table tr")
+        if not rows:
+            # テーブルIDが変わった場合の代替
+            rows = soup.select("tr.odd, tr.even")
+
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) < 4:
+                continue
+
+            time_str = cols[0].get_text(strip=True)
+            ticker   = cols[1].get_text(strip=True)
+            company  = cols[2].get_text(strip=True)
+            title_td = cols[3]
+            title    = title_td.get_text(strip=True)
+
+            # リンク取得
+            a_tag = title_td.find("a")
+            href  = ""
+            if a_tag and a_tag.get("href"):
+                href = "https://www.release.tdnet.info/inbs/" + a_tag["href"].lstrip("./")
+
+            # IDはURL末尾 or ticker+title のハッシュ
+            doc_id = href.split("=")[-1] if "=" in href else f"tdnet_{ticker}_{title[:20]}"
+
+            results.append({
+                "id":      doc_id,
+                "company": company,
+                "ticker":  ticker,
+                "title":   title,
+                "time":    time_str,
+                "url":     href,
+                "source":  "tdnet",
+            })
+
+        print(f"[TDnet] {len(results)}件取得")
+    except Exception as e:
+        print(f"[TDnet] 取得エラー: {e}")
+
+    return results
+
+def classify_tdnet(item: dict) -> str | None:
+    title = item.get("title", "")
+
+    if any(kw in title for kw in ["決算短信", "四半期決算短信", "中間決算短信"]):
+        return "earnings"
+    if any(kw in title for kw in ["上方修正", "下方修正", "業績修正", "業績予想の修正"]):
+        return "revision"
+    if any(kw in title for kw in ["薬事", "FDA", "治験", "新薬", "承認取得", "製造販売承認"]):
+        return "pharma"
+    return None
+
+# ──────────────────────────────────────────────
+# EDINET API（業績修正・薬事承認の補完用）
 # ──────────────────────────────────────────────
 def edinet_headers() -> dict:
     return {"Ocp-Apim-Subscription-Key": EDINET_API_KEY} if EDINET_API_KEY else {}
@@ -67,34 +138,23 @@ def fetch_edinet_documents(target_date: str) -> list[dict]:
         print(f"[EDINET] 取得エラー: {e}")
         return []
 
-# ──────────────────────────────────────────────
-# 書類分類
-# ──────────────────────────────────────────────
-def classify_doc(doc: dict) -> str | None:
+def classify_edinet(doc: dict) -> str | None:
     desc = doc.get("docDescription", "")
-
-    # 除外リスト
-    if any(kw in desc for kw in SKIP_KEYWORDS):
+    if any(kw in desc for kw in EDINET_SKIP):
         return None
-
-    # 決算短信（最優先）
-    if any(kw in desc for kw in ["決算短信", "四半期決算短信", "中間決算短信"]):
-        return "earnings"
-
-    # 業績修正
     if any(kw in desc for kw in ["上方修正", "下方修正", "業績修正", "業績予想の修正"]):
         return "revision"
-
-    # 新薬・薬事承認
     if any(kw in desc for kw in ["薬事", "FDA", "治験", "新薬", "承認取得", "製造販売承認"]):
         return "pharma"
-
     return None
 
 # ──────────────────────────────────────────────
 # yfinance 財務データ取得
 # ──────────────────────────────────────────────
 def get_financials(ticker_jp: str) -> dict:
+    # tickerが空・数字でない場合はスキップ
+    if not ticker_jp or not ticker_jp.isdigit():
+        return {}
     symbol = f"{ticker_jp}.T"
     try:
         tk   = yf.Ticker(symbol)
@@ -134,18 +194,18 @@ def fmt_yen(value) -> str:
         return f"{v/1e8:.1f}億円"
     return f"{v/1e4:.0f}万円"
 
-def build_earnings_embed(doc: dict, fin: dict) -> dict:
-    ticker  = (doc.get("secCode") or "").strip()
-    company = fin.get("company") or doc.get("filerName", "不明")
+def build_tdnet_earnings_embed(item: dict, fin: dict) -> dict:
+    ticker  = item.get("ticker", "").strip()
+    company = fin.get("company") or item.get("company", "不明")
     sector  = fin.get("sector") or "不明"
-    period  = doc.get("periodEnd", "")
-    desc    = doc.get("docDescription", "")
-    doc_url = f"https://disclosure2.edinet-fsa.go.jp/WZEK0040.aspx?S1{doc.get('docID','')}"
+    title   = item.get("title", "")
+    doc_url = item.get("url", "https://www.release.tdnet.info")
+    t       = item.get("time", "")
 
-    title = f"📊 {company}"
+    heading = f"📊 {company}"
     if ticker:
-        title += f"（{ticker}）"
-    title += " 決算発表"
+        heading += f"（{ticker}）"
+    heading += " 決算発表"
 
     fields = [
         {"name": "💹 売上高",     "value": fmt_yen(fin.get("revenue")),    "inline": True},
@@ -156,17 +216,46 @@ def build_earnings_embed(doc: dict, fin: dict) -> dict:
     return {
         "username": "決算Bot",
         "embeds": [{
-            "title":       title,
-            "description": desc[:150] if desc else "",
+            "title":       heading,
+            "description": title,
             "url":         doc_url,
             "color":       0x00b4d8,
             "fields":      fields,
-            "footer":      {"text": f"セクター: {sector}　|　決算期: {period}　|　EDINET"},
+            "footer":      {"text": f"セクター: {sector}　|　開示時刻: {t}　|　TDnet"},
             "timestamp":   datetime.utcnow().isoformat() + "Z",
         }]
     }
 
-def build_news_embed(doc: dict, doc_type: str) -> dict:
+def build_news_embed_tdnet(item: dict, doc_type: str) -> dict:
+    company = item.get("company", "不明")
+    ticker  = item.get("ticker", "").strip()
+    title   = item.get("title", "")
+    doc_url = item.get("url", "https://www.release.tdnet.info")
+    t       = item.get("time", "")
+
+    type_map = {
+        "revision": ("🔄 業績修正", 0xe63946 if "下方" in title else 0x2dc653),
+        "pharma":   ("💊 新薬・薬事承認", 0x9b5de5),
+    }
+    label, color = type_map.get(doc_type, ("📌 開示情報", 0xadb5bd))
+
+    heading = f"{label}｜{company}"
+    if ticker:
+        heading += f"（{ticker}）"
+
+    return {
+        "username": "ニュースBot",
+        "embeds": [{
+            "title":       heading,
+            "description": title,
+            "url":         doc_url,
+            "color":       color,
+            "footer":      {"text": f"開示時刻: {t}　|　TDnet"},
+            "timestamp":   datetime.utcnow().isoformat() + "Z",
+        }]
+    }
+
+def build_news_embed_edinet(doc: dict, doc_type: str) -> dict:
     company = doc.get("filerName", "不明")
     ticker  = (doc.get("secCode") or "").strip()
     desc    = doc.get("docDescription", "")
@@ -178,14 +267,14 @@ def build_news_embed(doc: dict, doc_type: str) -> dict:
     }
     label, color = type_map.get(doc_type, ("📌 開示情報", 0xadb5bd))
 
-    title = f"{label}｜{company}"
+    heading = f"{label}｜{company}"
     if ticker:
-        title += f"（{ticker}）"
+        heading += f"（{ticker}）"
 
     return {
         "username": "ニュースBot",
         "embeds": [{
-            "title":       title,
+            "title":       heading,
             "description": desc[:200] or "詳細はリンク先を確認",
             "url":         doc_url,
             "color":       color,
@@ -199,7 +288,7 @@ def build_news_embed(doc: dict, doc_type: str) -> dict:
 # ──────────────────────────────────────────────
 def post_discord(webhook_url: str, payload: dict):
     if not webhook_url:
-        print("[Discord] Webhook URLが空です。Secretsを確認してください。")
+        print("[Discord] Webhook URLが空です。")
         return
     r = requests.post(webhook_url, json=payload, timeout=15)
     if r.status_code == 429:
@@ -216,55 +305,61 @@ def post_discord(webhook_url: str, payload: dict):
 # メイン処理
 # ──────────────────────────────────────────────
 def main():
-    sent = load_sent()
+    sent     = load_sent()
+    new_sent = 0
     print(f"[送信済みID] {len(sent)}件をロード")
 
-    docs = []
-    for days_ago in range(0, 5):
+    # ── TDnet処理（決算短信メイン） ──────────────
+    tdnet_items = fetch_tdnet_disclosures()
+    tdnet_types = [classify_tdnet(i) for i in tdnet_items]
+    tdnet_counts = Counter(t for t in tdnet_types if t)
+    print(f"[TDnet分類] {tdnet_counts}")
+
+    for item, itype in zip(tdnet_items, tdnet_types):
+        if not itype:
+            continue
+        doc_id = f"tdnet_{item['id']}"
+        if doc_id in sent:
+            continue
+
+        ticker = item.get("ticker", "").strip()
+        fin    = get_financials(ticker) if ticker else {}
+
+        if itype == "earnings":
+            payload = build_tdnet_earnings_embed(item, fin)
+            post_discord(DISCORD_EARNINGS_WEBHOOK, payload)
+            print(f"[決算送信] {item['company']}（{ticker}）{item['title']}")
+        else:
+            payload = build_news_embed_tdnet(item, itype)
+            post_discord(DISCORD_NEWS_WEBHOOK, payload)
+            print(f"[ニュース送信] {itype} / {item['company']}")
+
+        sent.add(doc_id)
+        new_sent += 1
+        time.sleep(1)
+
+    # ── EDINET処理（業績修正・薬事承認の補完） ──
+    edinet_docs = []
+    for days_ago in range(0, 3):
         target = (date.today() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-        docs = fetch_edinet_documents(target)
-        if docs:
-            print(f"[EDINET] {target} のデータを使用 ({len(docs)}件)")
+        edinet_docs = fetch_edinet_documents(target)
+        if edinet_docs:
             break
 
-    if not docs:
-        print("[EDINET] 直近5日分すべて0件。終了。")
-        return
+    edinet_counts = Counter(classify_edinet(d) for d in edinet_docs if classify_edinet(d))
+    print(f"[EDINET分類] {edinet_counts}")
 
-    # デバッグ：実際の書類名を表示
-    print("[デバッグ] 書類サンプル（先頭30件）:")
-    for d in docs[:30]:
-        print(f"  desc={d.get('docDescription','')!r} | form={d.get('formCode','')} | sec={d.get('secCode','')}")
-
-    all_types = [classify_doc(d) for d in docs]
-    print(f"[分類結果] {Counter(t for t in all_types if t)}")
-
-    earnings_found = [(d, t) for d, t in zip(docs, all_types) if t == "earnings"]
-    print(f"[決算検出] {len(earnings_found)}件")
-    for d, _ in earnings_found:
-        print(f"  → {d.get('filerName','')} | {d.get('docDescription','')} | secCode={d.get('secCode','')}")
-
-    new_sent = 0
-    for doc in docs:
-        doc_id = doc.get("docID", "")
+    for doc in edinet_docs:
+        doc_id = f"edinet_{doc.get('docID','')}"
         if not doc_id or doc_id in sent:
             continue
-
-        doc_type = classify_doc(doc)
-        if not doc_type:
+        dtype = classify_edinet(doc)
+        if not dtype:
             continue
 
-        ticker = (doc.get("secCode") or "").strip()
-
-        if doc_type == "earnings":
-            fin     = get_financials(ticker) if ticker else {}
-            payload = build_earnings_embed(doc, fin)
-            post_discord(DISCORD_EARNINGS_WEBHOOK, payload)
-            print(f"[決算送信] {doc.get('filerName')}")
-        else:
-            payload = build_news_embed(doc, doc_type)
-            post_discord(DISCORD_NEWS_WEBHOOK, payload)
-            print(f"[ニュース送信] {doc_type} / {doc.get('filerName')}")
+        payload = build_news_embed_edinet(doc, dtype)
+        post_discord(DISCORD_NEWS_WEBHOOK, payload)
+        print(f"[ニュース送信EDINET] {dtype} / {doc.get('filerName')}")
 
         sent.add(doc_id)
         new_sent += 1
