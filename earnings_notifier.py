@@ -91,9 +91,18 @@ def fetch_tdnet() -> list[dict]:
                 if not doc_id or not title:
                     continue
 
-                # 個別株のみ（4桁数字）、REIT・投資信託・ETF等を除外
-                # 例: 個別株=72030, REIT=8960A, ETF=1234A など末尾アルファベットを除外
-                if not code.isdigit():
+                # 個別株のみ通知
+                # 除外条件:
+                # - アルファベット混じり（REIT: 8960A, ETF: 1570T など）
+                # - 5桁コードで1xxxx（ETF・上場投資信託は1000番台が多い）
+                # - 個別株は4桁数字コード（末尾に0が付いて5桁になる場合も）
+                pure_digits = code.isdigit()
+                four_digit = code[:4].isdigit() and len(code) == 5 and code[4] == "0"
+                is_stock = pure_digits and four_digit
+                # ETF・上場投信は1000番台除外
+                if is_stock and code[:2] in ("10", "11", "12", "13", "14", "15", "16", "17", "18", "19"):
+                    is_stock = False
+                if not is_stock:
                     continue
 
                 results.append({
