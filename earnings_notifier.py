@@ -141,7 +141,7 @@ def classify_edinet(doc: dict) -> str | None:
     return None
 
 # ──────────────────────────────────────────────
-# yfinance
+# yfinance（当期＋前期比）
 # ──────────────────────────────────────────────
 def get_financials(ticker_jp: str) -> dict:
     if not ticker_jp or not ticker_jp.isdigit():
@@ -149,19 +149,28 @@ def get_financials(ticker_jp: str) -> dict:
     try:
         tk   = yf.Ticker(f"{ticker_jp}.T")
         info = tk.info
-        fin  = tk.financials
-        revenue = net_income = None
-        if not fin.empty:
-            rev_key = [k for k in fin.index if "Revenue" in k]
-            inc_key = [k for k in fin.index if "Net Income" in k]
-            if rev_key: revenue    = fin.loc[rev_key[0]].iloc[0]
-            if inc_key: net_income = fin.loc[inc_key[0]].iloc[0]
+        fin  = tk.financials  # columns: 当期, 前期, ...（降順）
+
+        def extract(fin, keyword):
+            keys = [k for k in fin.index if keyword in k]
+            if not keys or fin.empty:
+                return None, None
+            row = fin.loc[keys[0]]
+            cur  = row.iloc[0] if len(row) > 0 else None
+            prev = row.iloc[1] if len(row) > 1 else None
+            return cur, prev
+
+        rev_cur,  rev_prev  = extract(fin, "Revenue")
+        inc_cur,  inc_prev  = extract(fin, "Net Income")
+
         return {
-            "company":    info.get("longName") or info.get("shortName", ""),
-            "sector":     info.get("sector", ""),
-            "revenue":    revenue,
-            "net_income": net_income,
-            "total_debt": info.get("totalDebt"),
+            "company":       info.get("longName") or info.get("shortName", ""),
+            "sector":        info.get("sector", ""),
+            "revenue":       rev_cur,
+            "revenue_prev":  rev_prev,
+            "net_income":    inc_cur,
+            "net_income_prev": inc_prev,
+            "total_debt":    info.get("totalDebt"),
         }
     except Exception as e:
         print(f"[yfinance] {ticker_jp} エラー: {e}")
@@ -177,11 +186,30 @@ def fmt_yen(value) -> str:
     if abs(v) >= 1e8:  return f"{v/1e8:.1f}億円"
     return f"{v/1e4:.0f}万円"
 
+def fmt_yoy(cur, prev) -> str:
+    """前期比を計算して矢印付きで返す"""
+    if cur is None or prev is None or prev == 0:
+        return ""
+    pct = (float(cur) - float(prev)) / abs(float(prev)) * 100
+    arrow = "🔺" if pct >= 0 else "🔻"
+    return f" {arrow}{abs(pct):.1f}%"
+
 def build_earnings_embed(item: dict, fin: dict) -> dict:
     ticker  = item.get("ticker", "").strip()
     company = fin.get("company") or item.get("company", "不明")
     sector  = fin.get("sector") or "不明"
     heading = f"📊 {company}" + (f"（{ticker}）" if ticker else "") + " 決算発表"
+
+    rev = fin.get("revenue")
+    inc = fin.get("net_income")
+    dbt = fin.get("total_debt")
+    rev_yoy = fmt_yoy(rev, fin.get("revenue_prev"))
+    inc_yoy = fmt_yoy(inc, fin.get("net_income_prev"))
+
+    rev_str = fmt_yen(rev) + rev_yoy if rev is not None else "N/A"
+    inc_str = fmt_yen(inc) + inc_yoy if inc is not None else "N/A"
+    dbt_str = fmt_yen(dbt)
+
     return {
         "username": "決算Bot",
         "embeds": [{
@@ -190,9 +218,9 @@ def build_earnings_embed(item: dict, fin: dict) -> dict:
             "url": item.get("url") or "https://www.release.tdnet.info",
             "color": 0x00b4d8,
             "fields": [
-                {"name": "💹 売上高",     "value": fmt_yen(fin.get("revenue")),    "inline": True},
-                {"name": "📈 純利益",     "value": fmt_yen(fin.get("net_income")), "inline": True},
-                {"name": "🏦 有利子負債", "value": fmt_yen(fin.get("total_debt")), "inline": True},
+                {"name": "💹 売上高",     "value": rev_str, "inline": True},
+                {"name": "📈 純利益",     "value": inc_str, "inline": True},
+                {"name": "🏦 有利子負債", "value": dbt_str, "inline": True},
             ],
             "footer": {"text": f"セクター: {sector} | TDnet"},
             "timestamp": datetime.utcnow().isoformat() + "Z",
