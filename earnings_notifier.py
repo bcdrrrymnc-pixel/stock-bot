@@ -78,13 +78,14 @@ def fetch_tdnet() -> list[dict]:
                 print(f"[TDnet] サンプル: {items[0]}")
 
             for item in items:
-                # フィールド名を柔軟に取得
-                doc_id  = str(item.get("id") or item.get("seqno") or item.get("document_id") or "")
-                company = item.get("company_name") or item.get("name") or item.get("company") or ""
-                ticker  = str(item.get("stockcode") or item.get("code") or item.get("ticker") or "").zfill(4)
-                title   = item.get("title") or item.get("document_name") or ""
-                pub_at  = item.get("pubdate") or item.get("published_at") or item.get("time") or ""
-                url_pdf = item.get("url") or item.get("document_url") or ""
+                # yanoshin APIは {"Tdnet": {...}} の入れ子構造
+                d = item.get("Tdnet") or item
+                doc_id  = str(d.get("id") or "")
+                company = d.get("company_name") or ""
+                ticker  = str(d.get("company_code") or "").replace("0", "", 1)[:4]
+                title   = d.get("title") or ""
+                pub_at  = d.get("pubdate") or ""
+                url_pdf = d.get("document_url") or ""
 
                 if not doc_id or not title:
                     continue
