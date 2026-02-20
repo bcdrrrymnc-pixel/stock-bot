@@ -231,6 +231,11 @@ def main():
         print("[EDINET] 直近5日分すべて0件。終了。")
         return
 
+    # デバッグ：実際の書類名を表示
+    print("[デバッグ] 書類サンプル（先頭30件）:")
+    for d in docs[:30]:
+        print(f"  desc={d.get('docDescription','')!r} | form={d.get('formCode','')} | sec={d.get('secCode','')}")
+
     all_types = [classify_doc(d) for d in docs]
     print(f"[分類結果] {Counter(t for t in all_types if t)}")
 
