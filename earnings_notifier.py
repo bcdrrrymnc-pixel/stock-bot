@@ -1,7 +1,7 @@
 """
 決算・ニュース Discord通知Bot
-- TDnet（東証適時開示）で決算短信をリアルタイム取得 ← メイン
-- EDINET APIで業績修正・薬事承認などを補完
+- TDnet RSSフィードで決算短信をリアルタイム取得
+- EDINET APIで業績修正・薬事承認を補完
 - yfinanceで財務データを取得
 """
 
@@ -10,7 +10,7 @@ import json
 import time
 import requests
 import yfinance as yf
-from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -19,9 +19,14 @@ DISCORD_EARNINGS_WEBHOOK = os.environ["DISCORD_EARNINGS_WEBHOOK"]
 DISCORD_NEWS_WEBHOOK     = os.environ["DISCORD_NEWS_WEBHOOK"]
 EDINET_API_KEY           = os.environ.get("EDINET_API_KEY", "")
 
-SENT_FILE    = Path("sent_ids.json")
-EDINET_BASE  = "https://api.edinet-fsa.go.jp/api/v2"
-TDNET_URL    = "https://www.release.tdnet.info/inbs/I_main_00.html"
+SENT_FILE   = Path("sent_ids.json")
+EDINET_BASE = "https://api.edinet-fsa.go.jp/api/v2"
+
+# TDnet RSSフィード（東証適時開示 全件）
+TDNET_RSS_URLS = [
+    "https://www.release.tdnet.info/inbs/RSS_I_main_00.xml",   # 当日全件
+    "https://www.release.tdnet.info/inbs/RSS_I_main_01.xml",   # 前日
+]
 
 EDINET_SKIP = [
     "有価証券報告書", "四半期報告書", "半期報告書",
@@ -29,6 +34,9 @@ EDINET_SKIP = [
     "変更報告書", "公開買付", "訂正", "有価証券届出書",
 ]
 
+# ──────────────────────────────────────────────
+# 送信済みID管理
+# ──────────────────────────────────────────────
 def load_sent() -> set:
     if SENT_FILE.exists():
         data = json.loads(SENT_FILE.read_text(encoding="utf-8"))
@@ -40,75 +48,67 @@ def save_sent(sent: set):
     SENT_FILE.write_text(json.dumps({"ids": ids}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ──────────────────────────────────────────────
-# TDnet スクレイピング（デバッグ版）
+# TDnet RSS取得
 # ──────────────────────────────────────────────
-def fetch_tdnet_disclosures() -> list[dict]:
+def fetch_tdnet_rss() -> list[dict]:
     results = []
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = requests.get(TDNET_URL, headers=headers, timeout=30)
-        r.encoding = "utf-8"
-        soup = BeautifulSoup(r.text, "html.parser")
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
 
-        # ── デバッグ：HTML構造を確認 ──
-        print(f"[TDnet] HTTPステータス: {r.status_code}")
-        print(f"[TDnet] ページタイトル: {soup.title}")
+    for rss_url in TDNET_RSS_URLS:
+        try:
+            r = requests.get(rss_url, headers=headers, timeout=30)
+            print(f"[TDnet RSS] {rss_url} → {r.status_code}")
 
-        # テーブル一覧
-        tables = soup.find_all("table")
-        print(f"[TDnet] テーブル数: {len(tables)}")
-        for t in tables[:5]:
-            print(f"  table id={t.get('id')!r} class={t.get('class')!r}")
-
-        # divのid一覧（構造把握）
-        divs = soup.find_all("div", id=True)
-        print(f"[TDnet] div id一覧: {[d.get('id') for d in divs[:20]]}")
-
-        # trを全部試す
-        all_rows = soup.find_all("tr")
-        print(f"[TDnet] tr総数: {len(all_rows)}")
-        for row in all_rows[:5]:
-            cols = row.find_all("td")
-            if cols:
-                print(f"  td数={len(cols)} | {[c.get_text(strip=True)[:30] for c in cols[:4]]}")
-
-        # ── パース試行1: id="main-list-table" ──
-        tbl = soup.select_one("table#main-list-table")
-        if tbl:
-            rows = tbl.find_all("tr")
-            print(f"[TDnet] main-list-table rows: {len(rows)}")
-        else:
-            print("[TDnet] main-list-table が見つかりません。全trで試みます。")
-            rows = all_rows
-
-        for row in rows:
-            cols = row.find_all("td")
-            if len(cols) < 4:
+            if r.status_code != 200:
                 continue
-            time_str = cols[0].get_text(strip=True)
-            ticker   = cols[1].get_text(strip=True)
-            company  = cols[2].get_text(strip=True)
-            title_td = cols[3]
-            title    = title_td.get_text(strip=True)
-            a_tag    = title_td.find("a")
-            href     = ""
-            if a_tag and a_tag.get("href"):
-                base = "https://www.release.tdnet.info/inbs/"
-                href = base + a_tag["href"].lstrip("./")
-            doc_id = href.split("=")[-1] if "=" in href else f"{ticker}_{title[:20]}"
 
-            results.append({
-                "id": doc_id, "company": company, "ticker": ticker,
-                "title": title, "time": time_str, "url": href, "source": "tdnet",
-            })
+            # デバッグ：先頭200文字表示
+            print(f"[TDnet RSS] 先頭: {r.text[:300]!r}")
 
-        print(f"[TDnet] パース結果: {len(results)}件")
-        if results:
-            print(f"[TDnet] サンプル: {results[0]}")
+            root = ET.fromstring(r.content)
+            ns   = {"": root.tag.split("}")[0].strip("{")} if "}" in root.tag else {}
 
-    except Exception as e:
-        print(f"[TDnet] エラー: {e}")
+            # RSS 2.0 形式
+            items = root.findall(".//item")
+            print(f"[TDnet RSS] item数: {len(items)}")
 
+            for item in items:
+                def txt(tag):
+                    el = item.find(tag)
+                    return el.text.strip() if el is not None and el.text else ""
+
+                title   = txt("title")
+                link    = txt("link")
+                pubdate = txt("pubDate")
+                desc    = txt("description")
+
+                # descriptionからticker・会社名を抽出
+                # 形式例: "7203 トヨタ自動車"
+                company = desc
+                ticker  = ""
+                parts   = desc.strip().split(" ", 1)
+                if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
+                    ticker  = parts[0]
+                    company = parts[1]
+
+                doc_id = link.split("=")[-1] if "=" in link else f"rss_{title[:30]}"
+
+                results.append({
+                    "id":      doc_id,
+                    "company": company,
+                    "ticker":  ticker,
+                    "title":   title,
+                    "time":    pubdate,
+                    "url":     link,
+                    "source":  "tdnet",
+                })
+
+        except Exception as e:
+            print(f"[TDnet RSS] エラー ({rss_url}): {e}")
+
+    print(f"[TDnet RSS] 合計: {len(results)}件")
+    if results:
+        print(f"[TDnet RSS] サンプル: {results[0]}")
     return results
 
 def classify_tdnet(item: dict) -> str | None:
@@ -121,6 +121,9 @@ def classify_tdnet(item: dict) -> str | None:
         return "pharma"
     return None
 
+# ──────────────────────────────────────────────
+# EDINET（業績修正・薬事承認の補完）
+# ──────────────────────────────────────────────
 def edinet_headers() -> dict:
     return {"Ocp-Apim-Subscription-Key": EDINET_API_KEY} if EDINET_API_KEY else {}
 
@@ -147,12 +150,14 @@ def classify_edinet(doc: dict) -> str | None:
         return "pharma"
     return None
 
+# ──────────────────────────────────────────────
+# yfinance
+# ──────────────────────────────────────────────
 def get_financials(ticker_jp: str) -> dict:
     if not ticker_jp or not ticker_jp.isdigit():
         return {}
-    symbol = f"{ticker_jp}.T"
     try:
-        tk = yf.Ticker(symbol)
+        tk   = yf.Ticker(f"{ticker_jp}.T")
         info = tk.info
         fin  = tk.financials
         revenue = net_income = None
@@ -162,7 +167,7 @@ def get_financials(ticker_jp: str) -> dict:
             if rev_key: revenue    = fin.loc[rev_key[0]].iloc[0]
             if inc_key: net_income = fin.loc[inc_key[0]].iloc[0]
         return {
-            "company":    info.get("longName") or info.get("shortName", symbol),
+            "company":    info.get("longName") or info.get("shortName", ""),
             "sector":     info.get("sector", ""),
             "revenue":    revenue,
             "net_income": net_income,
@@ -172,6 +177,9 @@ def get_financials(ticker_jp: str) -> dict:
         print(f"[yfinance] {ticker_jp} エラー: {e}")
         return {}
 
+# ──────────────────────────────────────────────
+# フォーマット
+# ──────────────────────────────────────────────
 def fmt_yen(value) -> str:
     if value is None: return "N/A"
     v = float(value)
@@ -183,19 +191,20 @@ def build_earnings_embed(item: dict, fin: dict) -> dict:
     ticker  = item.get("ticker", "").strip()
     company = fin.get("company") or item.get("company", "不明")
     sector  = fin.get("sector") or "不明"
-    title   = item.get("title", "")
-    doc_url = item.get("url", "https://www.release.tdnet.info")
     heading = f"📊 {company}" + (f"（{ticker}）" if ticker else "") + " 決算発表"
     return {
         "username": "決算Bot",
         "embeds": [{
-            "title": heading, "description": title, "url": doc_url, "color": 0x00b4d8,
+            "title": heading,
+            "description": item.get("title", ""),
+            "url": item.get("url", "https://www.release.tdnet.info"),
+            "color": 0x00b4d8,
             "fields": [
                 {"name": "💹 売上高",     "value": fmt_yen(fin.get("revenue")),    "inline": True},
                 {"name": "📈 純利益",     "value": fmt_yen(fin.get("net_income")), "inline": True},
                 {"name": "🏦 有利子負債", "value": fmt_yen(fin.get("total_debt")), "inline": True},
             ],
-            "footer": {"text": f"セクター: {sector} | {item.get('time','')} | TDnet"},
+            "footer": {"text": f"セクター: {sector} | TDnet"},
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }]
     }
@@ -220,22 +229,23 @@ def post_discord(webhook_url: str, payload: dict):
         return
     r = requests.post(webhook_url, json=payload, timeout=15)
     if r.status_code == 429:
-        retry = int(r.headers.get("Retry-After", 5))
-        time.sleep(retry)
+        time.sleep(int(r.headers.get("Retry-After", 5)))
         requests.post(webhook_url, json=payload, timeout=15)
     elif r.status_code not in (200, 204):
         print(f"[Discord] エラー {r.status_code}: {r.text[:200]}")
     else:
         print("[Discord] 送信成功")
 
+# ──────────────────────────────────────────────
+# メイン
+# ──────────────────────────────────────────────
 def main():
     sent = load_sent()
     new_sent = 0
     print(f"[送信済みID] {len(sent)}件をロード")
 
-    # TDnet
-    tdnet_items = fetch_tdnet_disclosures()
-    for item in tdnet_items:
+    # TDnet RSS
+    for item in fetch_tdnet_rss():
         itype = classify_tdnet(item)
         if not itype: continue
         doc_id = f"tdnet_{item['id']}"
@@ -259,7 +269,6 @@ def main():
         target = (date.today() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
         edinet_docs = fetch_edinet_documents(target)
         if edinet_docs: break
-
     for doc in edinet_docs:
         doc_id = f"edinet_{doc.get('docID','')}"
         if doc_id in sent: continue
