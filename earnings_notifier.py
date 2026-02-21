@@ -177,15 +177,37 @@ def get_financials(ticker_jp: str) -> dict:
 
         rev_cur,  rev_prev  = extract(fin, "Revenue")
         inc_cur,  inc_prev  = extract(fin, "Net Income")
+        op_cur,   op_prev   = extract(fin, "Operating Income")
+        # 経常利益はyfinanceに該当なし（日本基準特有）→ Pretax Incomeで代用
+        pre_cur,  pre_prev  = extract(fin, "Pretax Income")
+
+        # キャッシュフロー
+        cf = tk.cashflow
+        def extract_cf(cf, keyword):
+            keys = [k for k in cf.index if keyword in k]
+            if not keys or cf.empty: return None
+            row = cf.loc[keys[0]]
+            return row.iloc[0] if len(row) > 0 else None
+
+        op_cf  = extract_cf(cf, "Operating Cash Flow")
+        inv_cf = extract_cf(cf, "Investing Cash Flow")
+        fin_cf = extract_cf(cf, "Financing Cash Flow")
 
         return {
-            "company":       info.get("longName") or info.get("shortName", ""),
-            "sector":        info.get("sector", ""),
-            "revenue":       rev_cur,
-            "revenue_prev":  rev_prev,
-            "net_income":    inc_cur,
+            "company":         info.get("longName") or info.get("shortName", ""),
+            "sector":          info.get("sector", ""),
+            "revenue":         rev_cur,
+            "revenue_prev":    rev_prev,
+            "net_income":      inc_cur,
             "net_income_prev": inc_prev,
-            "total_debt":    info.get("totalDebt"),
+            "op_income":       op_cur,
+            "op_income_prev":  op_prev,
+            "pretax_income":   pre_cur,
+            "pretax_prev":     pre_prev,
+            "total_debt":      info.get("totalDebt"),
+            "op_cf":           op_cf,
+            "inv_cf":          inv_cf,
+            "fin_cf":          fin_cf,
         }
     except Exception as e:
         print(f"[yfinance] {ticker_jp} エラー: {e}")
@@ -219,15 +241,23 @@ def build_earnings_embed(item: dict, fin: dict) -> dict:
     sector  = fin.get("sector") or "不明"
     heading = f"📊 {company}" + (f"（{ticker}）" if ticker else "") + " 決算発表"
 
-    rev = fin.get("revenue")
-    inc = fin.get("net_income")
-    dbt = fin.get("total_debt")
-    rev_yoy = fmt_yoy(rev, fin.get("revenue_prev"))
-    inc_yoy = fmt_yoy(inc, fin.get("net_income_prev"))
+    def fs(cur, prev_key):
+        v = fin.get(cur)
+        s = fmt_yen(v) + fmt_yoy(v, fin.get(prev_key)) if v is not None else "N/A"
+        return s
 
-    rev_str = fmt_yen(rev) + rev_yoy if rev is not None else "N/A"
-    inc_str = fmt_yen(inc) + inc_yoy if inc is not None else "N/A"
-    dbt_str = fmt_yen(dbt)
+    def fc(key):
+        v = fin.get(key)
+        if v is None: return "N/A"
+        s = fmt_yen(v)
+        # CFはプラスマイナスの色分け
+        try:
+            fv = float(v)
+            if fv != fv: return "N/A"
+            s += " 🟢" if fv >= 0 else " 🔴"
+        except:
+            pass
+        return s
 
     return {
         "username": "決算Bot",
@@ -237,9 +267,15 @@ def build_earnings_embed(item: dict, fin: dict) -> dict:
             "url": item.get("url") or "https://www.release.tdnet.info",
             "color": 0x00b4d8,
             "fields": [
-                {"name": "💹 売上高",     "value": rev_str, "inline": True},
-                {"name": "📈 純利益",     "value": inc_str, "inline": True},
-                {"name": "🏦 有利子負債", "value": dbt_str, "inline": True},
+                {"name": "💹 売上高",           "value": fs("revenue",       "revenue_prev"),    "inline": True},
+                {"name": "🏭 営業利益",          "value": fs("op_income",     "op_income_prev"),  "inline": True},
+                {"name": "📋 経常利益(税前)",    "value": fs("pretax_income", "pretax_prev"),     "inline": True},
+                {"name": "📈 純利益",            "value": fs("net_income",    "net_income_prev"), "inline": True},
+                {"name": "🏦 有利子負債",        "value": fmt_yen(fin.get("total_debt")),         "inline": True},
+                {"name": "​",              "value": "​",                               "inline": True},
+                {"name": "💰 営業CF",            "value": fc("op_cf"),                            "inline": True},
+                {"name": "🔧 投資CF",            "value": fc("inv_cf"),                           "inline": True},
+                {"name": "💳 財務CF",            "value": fc("fin_cf"),                           "inline": True},
             ],
             "footer": {"text": f"セクター: {sector} | TDnet"},
             "timestamp": datetime.utcnow().isoformat() + "Z",
