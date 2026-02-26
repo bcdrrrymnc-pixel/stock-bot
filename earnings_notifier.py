@@ -133,7 +133,7 @@ def fetch_edinet_documents(target_date: str) -> list[dict]:
         return []
 
 def classify_edinet(doc: dict) -> str | None:
-    desc = doc.get("docDescription", "")
+    desc = doc.get("docDescription") or ""
     if any(kw in desc for kw in EDINET_SKIP):
         return None
     if any(kw in desc for kw in ["上方修正", "下方修正", "業績修正", "業績予想の修正"]):
