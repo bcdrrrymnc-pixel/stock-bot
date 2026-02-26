@@ -1,8 +1,8 @@
 """
 決算・ニュース Discord通知Bot
-- yanoshin TDnet API（非公式・無料）で決算短信をリアルタイム取得
+- yanoshin TDnet APIで決算短信・業績修正をリアルタイム取得
 - EDINET APIで業績修正・薬事承認を補完
-- yfinanceで財務データを取得
+- yfinanceで財務データ取得（単位・NaN修正済み）
 """
 
 import os
@@ -19,10 +19,6 @@ EDINET_API_KEY           = os.environ.get("EDINET_API_KEY", "")
 
 SENT_FILE   = Path("sent_ids.json")
 EDINET_BASE = "https://api.edinet-fsa.go.jp/api/v2"
-
-# yanoshin TDnet API（無料・非公式）
-# today = 当日のみ、recent = 直近
-TDNET_API_URL = "https://webapi.yanoshin.jp/webapi/tdnet/list/today.json"
 
 EDINET_SKIP = [
     "有価証券報告書", "四半期報告書", "半期報告書",
@@ -44,17 +40,23 @@ def save_sent(sent: set):
     SENT_FILE.write_text(json.dumps({"ids": ids}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ──────────────────────────────────────────────
-# yanoshin TDnet API
+# TDnet取得（当日のみ・重複防止）
 # ──────────────────────────────────────────────
 def fetch_tdnet() -> list[dict]:
     results = []
     headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
 
-    # 当日と前日の2日分取得
-    urls = [
-        "https://webapi.yanoshin.jp/webapi/tdnet/list/today.json",
-        "https://webapi.yanoshin.jp/webapi/tdnet/list/yesterday.json",
-    ]
+    # 当日分のみ取得（yesterdayは重複の原因になるため除外）
+    # ただし月曜日・祝日明けは前営業日も取得
+    today = date.today()
+    urls = ["https://webapi.yanoshin.jp/webapi/tdnet/list/today.json"]
+
+    # 月曜日（weekday=0）は金曜分も取得
+    if today.weekday() == 0:
+        friday = today - timedelta(days=3)
+        urls.append(f"https://webapi.yanoshin.jp/webapi/tdnet/list/{friday.strftime('%Y%m%d')}.json")
+
+    seen_ids = set()  # このfetch内での重複防止
 
     for url in urls:
         try:
@@ -63,48 +65,33 @@ def fetch_tdnet() -> list[dict]:
             if r.status_code != 200:
                 continue
 
-            data = r.json()
-            print(f"[TDnet] レスポンスキー: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            data  = r.json()
+            items = data.get("items") or [] if isinstance(data, dict) else data
 
-            # items or results or list
-            items = []
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                items = data.get("items") or data.get("results") or data.get("list") or []
-
-            print(f"[TDnet] {len(items)}件")
-            if items:
-                print(f"[TDnet] サンプル: {items[0]}")
+            print(f"[TDnet] {len(items)}件取得")
 
             for item in items:
-                # yanoshin APIは {"Tdnet": {...}} の入れ子構造
                 d = item.get("Tdnet") or item
                 doc_id  = str(d.get("id") or "")
                 company = d.get("company_name") or ""
                 code    = str(d.get("company_code") or "")
-                ticker  = code.replace("0", "", 1)[:4]
                 title   = d.get("title") or ""
                 pub_at  = d.get("pubdate") or ""
                 url_pdf = d.get("document_url") or ""
 
                 if not doc_id or not title:
                     continue
+                if doc_id in seen_ids:
+                    continue
+                seen_ids.add(doc_id)
 
-                # 個別株のみ通知
-                # 除外条件:
-                # - アルファベット混じり（REIT: 8960A, ETF: 1570T など）
-                # - 5桁コードで1xxxx（ETF・上場投資信託は1000番台が多い）
-                # - 個別株は4桁数字コード（末尾に0が付いて5桁になる場合も）
-                pure_digits = code.isdigit()
-                four_digit = code[:4].isdigit() and len(code) == 5 and code[4] == "0"
-                is_stock = pure_digits and four_digit
-                # ETF・上場投信は1000番台除外
-                if is_stock and code[:2] in ("10", "11", "12", "13", "14", "15", "16", "17", "18", "19"):
-                    is_stock = False
-                if not is_stock:
+                # 個別株のみ（4桁数字＋末尾0の5桁、ETF/REITを除外）
+                if not code.isdigit() or len(code) != 5 or code[4] != "0":
+                    continue
+                if code[:2] in ("10","11","12","13","14","15","16","17","18","19"):
                     continue
 
+                ticker = code[:4]
                 results.append({
                     "id": doc_id, "company": company, "ticker": ticker,
                     "title": title, "time": pub_at, "url": url_pdf,
@@ -127,7 +114,7 @@ def classify_tdnet(item: dict) -> str | None:
     return None
 
 # ──────────────────────────────────────────────
-# EDINET（業績修正・薬事承認の補完）
+# EDINET（業績修正・薬事承認補完）
 # ──────────────────────────────────────────────
 def edinet_headers() -> dict:
     return {"Ocp-Apim-Subscription-Key": EDINET_API_KEY} if EDINET_API_KEY else {}
@@ -156,58 +143,79 @@ def classify_edinet(doc: dict) -> str | None:
     return None
 
 # ──────────────────────────────────────────────
-# yfinance（当期＋前期比）
+# yfinance（単位・NaN修正）
 # ──────────────────────────────────────────────
+def safe_float(v) -> float | None:
+    """NaN・None・無効値をNoneに変換"""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return None if f != f else f  # NaNチェック
+    except:
+        return None
+
+def to_oku(v) -> float | None:
+    """円 → 億円に変換"""
+    f = safe_float(v)
+    return None if f is None else f / 1e8
+
 def get_financials(ticker_jp: str) -> dict:
     if not ticker_jp or not ticker_jp.isdigit():
         return {}
     try:
         tk   = yf.Ticker(f"{ticker_jp}.T")
         info = tk.info
-        fin  = tk.financials  # columns: 当期, 前期, ...（降順）
+        fin  = tk.financials   # 年次PL（単位：円）
+        cf   = tk.cashflow     # 年次CF（単位：円）
 
-        def extract(fin, keyword):
-            keys = [k for k in fin.index if keyword in k]
-            if not keys or fin.empty:
-                return None, None
-            row = fin.loc[keys[0]]
-            cur  = row.iloc[0] if len(row) > 0 else None
-            prev = row.iloc[1] if len(row) > 1 else None
-            return cur, prev
+        def get_row(df, *keywords):
+            """複数キーワードでDataFrameから行を探す"""
+            for kw in keywords:
+                keys = [k for k in df.index if kw in k]
+                if keys and not df.empty:
+                    row = df.loc[keys[0]]
+                    cur  = safe_float(row.iloc[0]) if len(row) > 0 else None
+                    prev = safe_float(row.iloc[1]) if len(row) > 1 else None
+                    return cur, prev
+            return None, None
 
-        rev_cur,  rev_prev  = extract(fin, "Revenue")
-        inc_cur,  inc_prev  = extract(fin, "Net Income")
-        op_cur,   op_prev   = extract(fin, "Operating Income")
-        # 経常利益はyfinanceに該当なし（日本基準特有）→ Pretax Incomeで代用
-        pre_cur,  pre_prev  = extract(fin, "Pretax Income")
+        # PL（単位：円 → 億円に変換して表示）
+        rev_cur,  rev_prev  = get_row(fin, "Total Revenue", "Revenue")
+        op_cur,   op_prev   = get_row(fin, "Operating Income", "EBIT")
+        pre_cur,  pre_prev  = get_row(fin, "Pretax Income")
+        inc_cur,  inc_prev  = get_row(fin, "Net Income")
 
-        # キャッシュフロー
-        cf = tk.cashflow
-        def extract_cf(cf, keyword):
-            keys = [k for k in cf.index if keyword in k]
-            if not keys or cf.empty: return None
-            row = cf.loc[keys[0]]
-            return row.iloc[0] if len(row) > 0 else None
+        # CF（単位：円 → 億円）
+        opcf_cur, _  = get_row(cf, "Operating Cash Flow", "Cash From Operations")
+        invcf_cur, _ = get_row(cf, "Investing Cash Flow", "Capital Expenditure")
+        fincf_cur, _ = get_row(cf, "Financing Cash Flow")
 
-        op_cf  = extract_cf(cf, "Operating Cash Flow")
-        inv_cf = extract_cf(cf, "Investing Cash Flow")
-        fin_cf = extract_cf(cf, "Financing Cash Flow")
+        # FCF = 営業CF + 投資CF
+        fcf = None
+        if opcf_cur is not None and invcf_cur is not None:
+            fcf = opcf_cur + invcf_cur
+
+        # 有利子負債（infoから）
+        total_debt = safe_float(info.get("totalDebt"))
 
         return {
             "company":         info.get("longName") or info.get("shortName", ""),
             "sector":          info.get("sector", ""),
-            "revenue":         rev_cur,
-            "revenue_prev":    rev_prev,
-            "net_income":      inc_cur,
-            "net_income_prev": inc_prev,
-            "op_income":       op_cur,
-            "op_income_prev":  op_prev,
-            "pretax_income":   pre_cur,
-            "pretax_prev":     pre_prev,
-            "total_debt":      info.get("totalDebt"),
-            "op_cf":           op_cf,
-            "inv_cf":          inv_cf,
-            "fin_cf":          fin_cf,
+            # 億円単位に変換
+            "revenue":         to_oku(rev_cur),
+            "revenue_prev":    to_oku(rev_prev),
+            "op_income":       to_oku(op_cur),
+            "op_income_prev":  to_oku(op_prev),
+            "pretax_income":   to_oku(pre_cur),
+            "pretax_prev":     to_oku(pre_prev),
+            "net_income":      to_oku(inc_cur),
+            "net_income_prev": to_oku(inc_prev),
+            "total_debt":      to_oku(total_debt),
+            "op_cf":           to_oku(opcf_cur),
+            "inv_cf":          to_oku(invcf_cur),
+            "fin_cf":          to_oku(fincf_cur),
+            "fcf":             to_oku(fcf),
         }
     except Exception as e:
         print(f"[yfinance] {ticker_jp} エラー: {e}")
@@ -216,24 +224,39 @@ def get_financials(ticker_jp: str) -> dict:
 # ──────────────────────────────────────────────
 # フォーマット
 # ──────────────────────────────────────────────
-def fmt_yen(value) -> str:
-    if value is None: return "N/A"
-    try:
-        v = float(value)
-        if v != v: return "N/A"  # NaNチェック
-        if abs(v) >= 1e12: return f"{v/1e12:.2f}兆円"
-        if abs(v) >= 1e8:  return f"{v/1e8:.1f}億円"
-        return f"{v/1e4:.0f}万円"
-    except:
+def fmt_oku(value) -> str:
+    """億円単位の数値を表示"""
+    v = safe_float(value)
+    if v is None:
         return "N/A"
+    if abs(v) >= 10000:
+        return f"{v/10000:.1f}兆円"
+    if abs(v) >= 1:
+        return f"{v:.1f}億円"
+    return f"{v*100:.0f}百万円"
 
 def fmt_yoy(cur, prev) -> str:
-    """前期比を計算して矢印付きで返す"""
-    if cur is None or prev is None or prev == 0:
+    c = safe_float(cur)
+    p = safe_float(prev)
+    if c is None or p is None or p == 0:
         return ""
-    pct = (float(cur) - float(prev)) / abs(float(prev)) * 100
+    pct = (c - p) / abs(p) * 100
     arrow = "🔺" if pct >= 0 else "🔻"
     return f" {arrow}{abs(pct):.1f}%"
+
+def fs(fin, cur_key, prev_key) -> str:
+    v = fin.get(cur_key)
+    if v is None:
+        return "N/A"
+    return fmt_oku(v) + fmt_yoy(v, fin.get(prev_key))
+
+def fc(fin, key) -> str:
+    v = fin.get(key)
+    if v is None:
+        return "N/A"
+    fv = safe_float(v)
+    sign = " 🟢" if fv is not None and fv >= 0 else " 🔴"
+    return fmt_oku(v) + sign
 
 def build_earnings_embed(item: dict, fin: dict) -> dict:
     ticker  = item.get("ticker", "").strip()
@@ -241,43 +264,29 @@ def build_earnings_embed(item: dict, fin: dict) -> dict:
     sector  = fin.get("sector") or "不明"
     heading = f"📊 {company}" + (f"（{ticker}）" if ticker else "") + " 決算発表"
 
-    def fs(cur, prev_key):
-        v = fin.get(cur)
-        s = fmt_yen(v) + fmt_yoy(v, fin.get(prev_key)) if v is not None else "N/A"
-        return s
-
-    def fc(key):
-        v = fin.get(key)
-        if v is None: return "N/A"
-        s = fmt_yen(v)
-        # CFはプラスマイナスの色分け
-        try:
-            fv = float(v)
-            if fv != fv: return "N/A"
-            s += " 🟢" if fv >= 0 else " 🔴"
-        except:
-            pass
-        return s
+    # FCF計算
+    fcf_str = fc(fin, "fcf")
 
     return {
         "username": "決算Bot",
         "embeds": [{
-            "title": heading,
+            "title":       heading,
             "description": item.get("title", ""),
-            "url": item.get("url") or "https://www.release.tdnet.info",
-            "color": 0x00b4d8,
+            "url":         item.get("url") or "https://www.release.tdnet.info",
+            "color":       0x00b4d8,
             "fields": [
-                {"name": "💹 売上高",           "value": fs("revenue",       "revenue_prev"),    "inline": True},
-                {"name": "🏭 営業利益",          "value": fs("op_income",     "op_income_prev"),  "inline": True},
-                {"name": "📋 経常利益(税前)",    "value": fs("pretax_income", "pretax_prev"),     "inline": True},
-                {"name": "📈 純利益",            "value": fs("net_income",    "net_income_prev"), "inline": True},
-                {"name": "🏦 有利子負債",        "value": fmt_yen(fin.get("total_debt")),         "inline": True},
-                {"name": "​",              "value": "​",                               "inline": True},
-                {"name": "💰 営業CF",            "value": fc("op_cf"),                            "inline": True},
-                {"name": "🔧 投資CF",            "value": fc("inv_cf"),                           "inline": True},
-                {"name": "💳 財務CF",            "value": fc("fin_cf"),                           "inline": True},
+                {"name": "💹 売上高",         "value": fs(fin, "revenue",       "revenue_prev"),    "inline": True},
+                {"name": "🏭 営業利益",        "value": fs(fin, "op_income",     "op_income_prev"),  "inline": True},
+                {"name": "📋 経常利益(税前)",  "value": fs(fin, "pretax_income", "pretax_prev"),     "inline": True},
+                {"name": "📈 純利益",          "value": fs(fin, "net_income",    "net_income_prev"), "inline": True},
+                {"name": "🏦 有利子負債",      "value": fmt_oku(fin.get("total_debt")),              "inline": True},
+                {"name": "\u200b",             "value": "\u200b",                                    "inline": True},
+                {"name": "💰 営業CF",          "value": fc(fin, "op_cf"),                            "inline": True},
+                {"name": "🔧 投資CF",          "value": fc(fin, "inv_cf"),                           "inline": True},
+                {"name": "💳 財務CF",          "value": fc(fin, "fin_cf"),                           "inline": True},
+                {"name": "📉 FCF",             "value": fcf_str,                                     "inline": True},
             ],
-            "footer": {"text": f"セクター: {sector} | TDnet"},
+            "footer":    {"text": f"セクター: {sector} | ※前期比はyfinance年次データ | TDnet"},
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }]
     }
@@ -313,16 +322,18 @@ def post_discord(webhook_url: str, payload: dict):
 # メイン
 # ──────────────────────────────────────────────
 def main():
-    sent = load_sent()
+    sent     = load_sent()
     new_sent = 0
     print(f"[送信済みID] {len(sent)}件をロード")
 
-    # TDnet（yanoshin API）
+    # TDnet（当日分）
     for item in fetch_tdnet():
         itype = classify_tdnet(item)
-        if not itype: continue
+        if not itype:
+            continue
         doc_id = f"tdnet_{item['id']}"
-        if doc_id in sent: continue
+        if doc_id in sent:
+            continue
         ticker = item.get("ticker", "").strip()
         if itype == "earnings":
             fin = get_financials(ticker) if ticker else {}
@@ -336,17 +347,15 @@ def main():
         new_sent += 1
         time.sleep(1)
 
-    # EDINET補完
-    edinet_docs = []
-    for days_ago in range(3):
-        target = (date.today() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-        edinet_docs = fetch_edinet_documents(target)
-        if edinet_docs: break
-    for doc in edinet_docs:
+    # EDINET補完（当日のみ）
+    target = date.today().strftime("%Y-%m-%d")
+    for doc in fetch_edinet_documents(target):
         doc_id = f"edinet_{doc.get('docID','')}"
-        if doc_id in sent: continue
+        if doc_id in sent:
+            continue
         dtype = classify_edinet(doc)
-        if not dtype: continue
+        if not dtype:
+            continue
         ticker = (doc.get("secCode") or "").strip()
         desc   = doc.get("docDescription", "")
         url    = f"https://disclosure2.edinet-fsa.go.jp/WZEK0040.aspx?S1{doc.get('docID','')}"
