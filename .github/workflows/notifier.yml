@@ -45,4 +45,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add sent_ids.json
           git diff --staged --quiet || git commit -m "chore: update sent_ids [skip ci]"
-          git push
+          # 競合時はpullしてリトライ
+          for i in 1 2 3; do
+            git push && break
+            echo "push失敗 ($i回目)、pullしてリトライ..."
+            git pull --rebase
+          done
