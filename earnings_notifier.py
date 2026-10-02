@@ -9,7 +9,6 @@ import os
 import json
 import time
 import requests
-import yfinance as yf
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -93,8 +92,17 @@ def fetch_tdnet() -> list[dict]:
 
                 ticker = code[:4]
                 results.append({
-                    "id": doc_id, "company": company, "ticker": ticker,
-                    "title": title, "time": pub_at, "url": url_pdf,
+                    "id":      doc_id,
+                    "company": company,
+                    "ticker":  ticker,
+                    "title":   title,
+                    "time":    pub_at,
+                    "url":     url_pdf,
+                    # XBRL財務データURL（get_financialsで使用）
+                    "url_report_type_summary":            d.get("url_report_type_summary"),
+                    "url_report_type_fs_consolidated":    d.get("url_report_type_fs_consolidated"),
+                    "url_report_type_fs_non_consolidated": d.get("url_report_type_fs_non_consolidated"),
+                    "url_xbrl": d.get("url_xbrl"),
                 })
 
         except Exception as e:
@@ -156,70 +164,118 @@ def safe_float(v) -> float | None:
         return None
 
 def to_oku(v) -> float | None:
-    """円 → 億円に変換"""
+    """百万円 → 億円に変換"""
     f = safe_float(v)
-    return None if f is None else f / 1e8
+    return None if f is None else f / 100
 
-def get_financials(ticker_jp: str) -> dict:
-    if not ticker_jp or not ticker_jp.isdigit():
-        return {}
+def get_financials(ticker_jp: str, tdnet_item: dict = None) -> dict:
+    """yanoshin XBRLから財務データを取得"""
+    company = (tdnet_item or {}).get("company", "")
+
+    if tdnet_item:
+        result = fetch_xbrl_summary(tdnet_item)
+        if result:
+            result["company"] = result.get("company") or company
+            return result
+
+    return {"company": company, "sector": ""}
+
+def fetch_xbrl_summary(item: dict) -> dict | None:
+    """yanoshinのXBRL/サマリーURLから財務データを取得"""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
+
+    # yanoshinが提供するXBRL関連URL（連結優先）
+    urls = [u for u in [
+        item.get("url_report_type_fs_consolidated"),
+        item.get("url_report_type_fs_non_consolidated"),
+        item.get("url_report_type_summary"),
+        item.get("url_xbrl"),
+    ] if u]
+
+    print(f"[XBRL] URL候補: {len(urls)}件")
+
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            print(f"[XBRL] {url[:60]} → {r.status_code}")
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            result = parse_xbrl_response(data)
+            if result:
+                print(f"[XBRL] 財務データ取得成功")
+                return result
+        except Exception as e:
+            print(f"[XBRL] エラー: {e}")
+            continue
+
+    print(f"[XBRL] データ取得できず（全URLがNoneまたは失敗）")
+    return None
+
+def parse_xbrl_response(data) -> dict | None:
+    """yanoshin XBRLレスポンスをパース（百万円単位を想定）"""
     try:
-        tk   = yf.Ticker(f"{ticker_jp}.T")
-        info = tk.info
-        fin  = tk.financials   # 年次PL（単位：円）
-        cf   = tk.cashflow     # 年次CF（単位：円）
+        if not isinstance(data, dict):
+            return None
 
-        def get_row(df, *keywords):
-            """複数キーワードでDataFrameから行を探す"""
-            for kw in keywords:
-                keys = [k for k in df.index if kw in k]
-                if keys and not df.empty:
-                    row = df.loc[keys[0]]
-                    cur  = safe_float(row.iloc[0]) if len(row) > 0 else None
-                    prev = safe_float(row.iloc[1]) if len(row) > 1 else None
-                    return cur, prev
-            return None, None
+        # yanoshinのXBRL JSONは {キー: {value: 数値, ...}} の構造
+        def find(d, *keys):
+            for k in keys:
+                for dk in list(d.keys()):
+                    if k.lower() in dk.lower():
+                        v = d[dk]
+                        if isinstance(v, (int, float)):
+                            return safe_float(v)
+                        if isinstance(v, dict):
+                            for vk in ("value", "Amount", "current", "CurrentYearDuration"):
+                                if vk in v:
+                                    return safe_float(v[vk])
+            return None
 
-        # PL（単位：円 → 億円に変換して表示）
-        rev_cur,  rev_prev  = get_row(fin, "Total Revenue", "Revenue")
-        op_cur,   op_prev   = get_row(fin, "Operating Income", "EBIT")
-        pre_cur,  pre_prev  = get_row(fin, "Pretax Income")
-        inc_cur,  inc_prev  = get_row(fin, "Net Income")
+        rev   = find(data, "NetSales", "Revenue", "Sales")
+        op    = find(data, "OperatingIncome", "OperatingProfit")
+        pre   = find(data, "OrdinaryIncome", "IncomeBeforeTax", "PretaxIncome")
+        net   = find(data, "NetIncome", "ProfitAttributable", "NetProfit")
+        debt  = find(data, "InterestBearingDebt", "BorrowingsAndBonds", "Debt")
+        opcf  = find(data, "OperatingCF", "CashFromOperating", "NetCashProvidedByOperating")
+        invcf = find(data, "InvestingCF", "CashFromInvesting", "NetCashUsedInInvesting")
+        fincf = find(data, "FinancingCF", "CashFromFinancing", "NetCashUsedInFinancing")
 
-        # CF（単位：円 → 億円）
-        opcf_cur, _  = get_row(cf, "Operating Cash Flow", "Cash From Operations")
-        invcf_cur, _ = get_row(cf, "Investing Cash Flow", "Capital Expenditure")
-        fincf_cur, _ = get_row(cf, "Financing Cash Flow")
+        # 全部Noneなら失敗
+        if all(v is None for v in [rev, op, pre, net]):
+            return None
 
-        # FCF = 営業CF + 投資CF
         fcf = None
-        if opcf_cur is not None and invcf_cur is not None:
-            fcf = opcf_cur + invcf_cur
+        if opcf is not None and invcf is not None:
+            fcf = opcf + invcf
 
-        # 有利子負債（infoから）
-        total_debt = safe_float(info.get("totalDebt"))
+        # 値が大きすぎる場合は円単位→百万円単位に変換
+        def normalize(v):
+            if v is None: return None
+            if abs(v) > 1e10:  # 1兆円超なら円単位と判断
+                return v / 1_000_000
+            return v
 
         return {
-            "company":         info.get("longName") or info.get("shortName", ""),
-            "sector":          info.get("sector", ""),
-            # 億円単位に変換
-            "revenue":         to_oku(rev_cur),
-            "revenue_prev":    to_oku(rev_prev),
-            "op_income":       to_oku(op_cur),
-            "op_income_prev":  to_oku(op_prev),
-            "pretax_income":   to_oku(pre_cur),
-            "pretax_prev":     to_oku(pre_prev),
-            "net_income":      to_oku(inc_cur),
-            "net_income_prev": to_oku(inc_prev),
-            "total_debt":      to_oku(total_debt),
-            "op_cf":           to_oku(opcf_cur),
-            "inv_cf":          to_oku(invcf_cur),
-            "fin_cf":          to_oku(fincf_cur),
-            "fcf":             to_oku(fcf),
+            "company":         "",
+            "sector":          "",
+            "revenue":         to_oku(normalize(rev)),
+            "revenue_prev":    None,
+            "op_income":       to_oku(normalize(op)),
+            "op_income_prev":  None,
+            "pretax_income":   to_oku(normalize(pre)),
+            "pretax_prev":     None,
+            "net_income":      to_oku(normalize(net)),
+            "net_income_prev": None,
+            "total_debt":      to_oku(normalize(debt)),
+            "op_cf":           to_oku(normalize(opcf)),
+            "inv_cf":          to_oku(normalize(invcf)),
+            "fin_cf":          to_oku(normalize(fincf)),
+            "fcf":             to_oku(normalize(fcf)),
         }
     except Exception as e:
-        print(f"[yfinance] {ticker_jp} エラー: {e}")
-        return {}
+        print(f"[XBRL parse] エラー: {e}")
+        return None
 
 # ──────────────────────────────────────────────
 # フォーマット
@@ -286,7 +342,7 @@ def build_earnings_embed(item: dict, fin: dict) -> dict:
                 {"name": "💳 財務CF",          "value": fc(fin, "fin_cf"),                           "inline": True},
                 {"name": "📉 FCF",             "value": fcf_str,                                     "inline": True},
             ],
-            "footer":    {"text": f"セクター: {sector} | ※前期比はyfinance年次データ | TDnet"},
+            "footer":    {"text": f"セクター: {sector} | ※データはXBRL（TDnet）から取得"},
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }]
     }
@@ -336,7 +392,7 @@ def main():
             continue
         ticker = item.get("ticker", "").strip()
         if itype == "earnings":
-            fin = get_financials(ticker) if ticker else {}
+            fin = get_financials(ticker, tdnet_item=item)
             post_discord(DISCORD_EARNINGS_WEBHOOK, build_earnings_embed(item, fin))
             print(f"[決算送信] {item['company']}（{ticker}）")
         else:
